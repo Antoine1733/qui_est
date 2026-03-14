@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <title>Qui Est ?</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Bungee&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <!-- Board drawer (bottom sheet) – outside app-shell to avoid overflow clipping -->
+    <div id="board-drawer" class="board-drawer" aria-hidden="true">
+      <div class="drawer-handle"></div>
+      <div class="drawer-header">
+        <span class="drawer-title">Profils — <span id="remaining-count-2">0</span> restants</span>
+        <button id="board-close-btn" class="btn-icon" aria-label="Fermer">✕</button>
+      </div>
+      <div class="drawer-scroll">
+        <div id="board" class="board"></div>
+      </div>
+      <!-- Overlay résultat (victoire / défaite) affiché par-dessus les photos -->
+      <div id="drawer-result-overlay" class="drawer-result-overlay hidden" aria-live="assertive">
+        <div class="dro-inner">
+          <span id="dro-emoji" class="dro-emoji"></span>
+          <p id="dro-message" class="dro-message"></p>
+          <p id="dro-name" class="dro-name"></p>
+          <button id="dro-replay-btn" class="btn btn-play-again">🎲 Rejouer</button>
+        </div>
+      </div>
+    </div>
+    <div id="board-backdrop" class="board-backdrop" aria-hidden="true"></div>
+
+    <div class="app-shell">
+
+      <header class="topbar">
+        <div class="topbar-left">
+          <h1 class="logo">Qui&nbsp;Est&nbsp;?</h1>
+          <span class="badge-remaining" id="remaining-count" title="Profils restants">0</span>
+        </div>
+        <div class="topbar-actions">
+          <button id="board-toggle-btn" class="btn btn-ghost" type="button">👥 Photos</button>
+          <button id="new-game-btn" class="btn btn-ghost" type="button">↺ Nouvelle</button>
+        </div>
+      </header>
+
+      <main class="chat-section" id="scroll-area">
+        <p id="status" class="status-pill">Appuie sur "Nouvelle" pour commencer.</p>
+        <div id="chat-log" class="chat-log" aria-live="polite"></div>
+        <div id="result" class="result-card hidden"></div>
+        <button id="play-again-btn" class="btn btn-play-again hidden" type="button">🎲 Rejouer</button>
+      </main>
+
+      <footer class="input-bar">
+        <form id="question-form" class="question-form">
+          <input
+            id="question-input"
+            name="question"
+            type="text"
+            placeholder="Pose une question…"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="sentences"
+            spellcheck="false"
+            required
+          />
+          <button id="ask-btn" class="btn btn-send" type="submit" aria-label="Envoyer">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+        </form>
+      </footer>
+
+    </div>
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </body>
+</html>
