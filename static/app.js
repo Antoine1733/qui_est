@@ -176,9 +176,13 @@ function toggleCharacter(characterId) {
 
 async function startNewGame() {
   setLoading(true);
+  const cfg = window.GAME_CONFIG || {};
+  const url = cfg.deploymentId
+    ? `/api/new-game?d=${encodeURIComponent(cfg.deploymentId)}`
+    : "/api/new-game";
 
   try {
-    const response = await fetch("/api/new-game");
+    const response = await fetch(url);
     const data = await response.json();
 
     if (!response.ok) {
@@ -294,7 +298,7 @@ async function verifyLastCharacter(guessId) {
       ? `En ${qCount} question${plural} !`
       : `C'était ${data.secret.name} — ${qCount} question${plural}.`;
     elements.droEmoji.textContent = isWin ? "🎉" : "😢";
-    elements.droMessage.textContent = isWin ? "Bravo !" : "Perdu !";
+    elements.droMessage.textContent = isWin ? `Bravo ! C'était ${data.secret.name}` : "Perdu !";
     elements.droName.textContent = scoreText;
     elements.drawerResultOverlay.classList.remove("hidden", "is-win", "is-lose");
     elements.drawerResultOverlay.classList.add(isWin ? "is-win" : "is-lose");
@@ -325,3 +329,49 @@ elements.boardCloseBtn.addEventListener("click", closeDrawer);
 elements.boardBackdrop.addEventListener("click", closeDrawer);
 
 startNewGame();
+
+// ── Login modal ──────────────────────────────────────────────────
+(function () {
+  const cfg = window.GAME_CONFIG || {};
+  const backdrop = document.getElementById('login-backdrop');
+  if (!backdrop) return;
+
+  if (cfg.showLoginModal) {
+    backdrop.classList.remove('hidden');
+    setTimeout(() => document.getElementById('login-email-input')?.focus(), 100);
+  }
+
+  async function doLogin() {
+    const email = document.getElementById('login-email-input').value.trim();
+    const errorEl = document.getElementById('login-error');
+    errorEl.textContent = '';
+    if (!email || !email.includes('@')) {
+      errorEl.textContent = 'Adresse e-mail invalide.';
+      return;
+    }
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        backdrop.classList.add('hidden');
+        if (cfg.nextUrl) window.location.href = cfg.nextUrl;
+      } else {
+        errorEl.textContent = data.error || 'Erreur.';
+      }
+    } catch {
+      document.getElementById('login-error').textContent = 'Erreur réseau.';
+    }
+  }
+
+  document.getElementById('login-submit-btn').addEventListener('click', doLogin);
+  document.getElementById('login-email-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') doLogin();
+  });
+  document.getElementById('login-skip-btn').addEventListener('click', () => {
+    backdrop.classList.add('hidden');
+  });
+})();

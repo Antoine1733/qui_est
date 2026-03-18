@@ -1,28 +1,5 @@
 [
   {
-    "id": "loli",
-    "name": "Loli",
-    "attributes": {
-      "genre": "femme",
-      "cheveux": "brun",
-      "type cheveux": "souvent lisse et parfois ondulé",
-      "yeux": "marron",
-      "lunettes": "oui pour lire",
-      "barbe": "non",
-      "moustache": "non",
-      "chapeau": "non",
-      "taille": "grande",
-      "corpulence": "moyenne",
-      "coupe_cheveux": "longs",
-      "frange": "non",
-      "teint": "clair",
-      "sourcils": "fins",
-      "nez": "petit",
-      "levres": "fines",
-      "Caracteristique": "adore lire, adore être dans les potins"
-    }
-  },
-  {
     "id": "victoria",
     "name": "Victoria",
     "attributes": {
@@ -35,37 +12,12 @@
       "chapeau": "non",
       "taille": "petite",
       "corpulence": "fine",
-      "coupe_cheveux": "longs",
-      "type cheveux": "ondulé",
-      "frange": "non",
+      "coupe de cheveux": "longs",
+      "type de cheveux": "ondulé",
       "teint": "clair",
       "sourcils": "entre epais et fins",
       "nez": "petit",
-      "levres": "fine",
-      "Caracteristique" : "ressemble beaucoup à Alice"
-    }
-  },
-  {
-    "id": "alice",
-    "name": "Alice",
-    "attributes": {
-      "genre": "femme",
-      "cheveux": "brun",
-      "yeux": "bleu",
-      "lunettes": "non",
-      "barbe": "non",
-      "moustache": "non",
-      "chapeau": "non",
-      "taille": "petite",
-      "corpulence": "fine",
-      "coupe_cheveux": "longs",
-      "type cheveux": "ondulé",
-      "frange": "non",
-      "teint": "clair",
-      "sourcils": "entre epais et fins",
-      "nez": "petit",
-      "levres": "fine",
-      "Caracteristique" : "ressemble beaucoup à Victoria"
+      "levres": "fine"
     }
   },
   {
@@ -79,67 +31,14 @@
       "barbe": "oui",
       "moustache": "non",
       "chapeau": "non",
-      "accessoire": "non",
       "taille": "moyen-grand",
       "corpulence": "fin et sportif",
-      "coupe_cheveux": "courts et parfois un peu plus long",
-      "type cheveux": "bouclés",
+      "coupe de cheveux": "courts et parfois un peu plus long",
+      "type de cheveux": "bouclés",
       "teint": "clair",
-      "forme_visage": "ovale",
       "sourcils": "epais",
       "nez": "droit",
-      "levres": "normal",
-      "caracteristique": "le mec cool, à monté une boite"
-    }
-  },
-  {
-    "id": "william",
-    "name": "William",
-    "attributes": {
-      "genre": "homme",
-      "cheveux": "brun",
-      "yeux": "marron",
-      "lunettes": "non",
-      "barbe": "non",
-      "moustache": "non",
-      "chapeau": "non",
-      "accessoire": "non",
-      "age": "25-30",
-      "taille": "grande",
-      "corpulence": "fin et sportif",
-      "coupe_cheveux": "court",
-      "type cheveux": "de temps en temps bouclés",
-      "frange": "non",
-      "teint": "clair et parfois bronzé",
-      "forme_visage": "rond",
-      "sourcils": "moyens",
-      "nez": "normal",
-      "levres": "pulpeuses",
-      "caracteristique": "le mec cool, à monté une boite"
-    }
-  },
-  {
-    "id": "jean-baptiste",
-    "name": "Jean-Baptiste",
-    "attributes": {
-      "genre": "homme",
-      "cheveux": "brun",
-      "yeux": "vert",
-      "lunettes": "non",
-      "barbe": "oui",
-      "moustache": "oui souvent",
-      "chapeau": "non",
-      "accessoire": "non",
-      "taille": "grande",
-      "corpulence": "moyenne",
-      "coupe_cheveux": "courts",
-      "type cheveux": "bouclés",
-      "frange": "non",
-      "teint": "fonce",
-      "forme_visage": "normal",
-      "sourcils": "normal",
-      "nez": "normal",
-      "caracteristique": "toujours en retard"
+      "levres": "normal"
     }
   },
   {
@@ -153,17 +52,14 @@
       "barbe": "non",
       "moustache": "non",
       "chapeau": "non",
-      "accessoire": "aucun",
       "taille": "grande",
       "corpulence": "moyenne",
-      "coupe_cheveux": "courts et a eu long",
-      "type cheveux": "ondulé",
+      "coupe de cheveux": "courts et a eu long",
+      "type de cheveux": "ondulé",
       "teint": "souvent bronzé",
-      "forme_visage": "ujn peu ovale",
       "sourcils": "epais",
       "nez": "un peu gros",
-      "levres": "fine",
-      "Caracteristique" : "Adore parler de power bi"
+      "levres": "fine"
     }
   },
   {
@@ -179,34 +75,12 @@
       "chapeau": "non",
       "taille": "grande",
       "corpulence": "moyenne",
-      "coupe_cheveux": "longs",
-      "type cheveux": "bouclés, beaucoup de volume",
-      "frange": "non",
+      "coupe de cheveux": "longs",
+      "type de cheveux": "bouclés, beaucoup de volume",
       "teint": "clair et parfois bronzé",
-      "forme_visage": "grosse tête",
       "sourcils": "epais",
+      "nez": "normal",
       "levres": "normal"
-    }
-  },
-  {
-    "id": "paul",
-    "name": "Paul",
-    "attributes": {
-      "genre": "homme",
-      "cheveux": "blond",
-      "yeux": "bleu",
-      "lunettes": "non",
-      "barbe": "oui",
-      "moustache": "non",
-      "taille": "moyenne-grande",
-      "corpulence": "forte",
-      "coupe_cheveux": "courts",
-      "type cheveux": "bouclés",
-      "teint": "clair",
-      "forme_visage": "carre",
-      "sourcils": "epais",
-      "levres": "fines",
-      "caracteristique": "Il fait souvent des gaffes et est un grand medecin"
     }
   },
   {
@@ -219,16 +93,16 @@
       "lunettes": "oui",
       "barbe": "un peu",
       "moustache": "non",
+      "chapeau": "non",
       "taille": "petit-moyen",
       "corpulence": "fine-sportive",
-      "coupe_cheveux": "court",
-      "type cheveux": "bouclés",
+      "coupe de cheveux": "court",
+      "type de cheveux": "bouclés",
       "teint": "roux",
       "sourcils": "moyens",
-      "levres": "moyennes",
-      "sourire": "oui",
-      "caracteristique": "ne répond jamais aux messages"
-    }
+      "nez": "normal",
+      "levres": "moyennes"
+       }
   },
   {
     "id": "capucine",
@@ -240,15 +114,15 @@
       "lunettes": "oui",
       "barbe": "non",
       "moustache": "non",
+      "chapeau": "non",
       "taille": "petite",
       "corpulence": "avec des formes",
-      "coupe_cheveux": "carré",
-      "type cheveux": "lisse",
+      "coupe de cheveux": "carré",
+      "type de cheveux": "lisse",
       "teint": "clair",
       "sourcils": "fins",
       "nez": "petit",
-      "levres": "pulpeuses",
-      "caracteristique" : "se couche tôt"
+      "levres": "pulpeuses"
 
     }
   },
@@ -265,33 +139,12 @@
       "chapeau": "non",
       "taille": "moyenne",
       "corpulence": "moyenne",
-      "coupe_cheveux": "mi_longs",
-      "type cheveux": "lisse",
-      "frange": "oui",
+      "coupe de cheveux": "mi_longs",
+      "type de cheveux": "lisse",
       "teint": "mat",
       "sourcils": "moyens",
-      "levres": "moyennes",
-      "caracteristique" : "bordelaise !"
-    }
-  },
-  {
-    "id": "thomas",
-    "name": "Thomas",
-    "attributes": {
-      "genre": "homme",
-      "cheveux": "brun",
-      "yeux": "marron",
-      "lunettes": "oui",
-      "barbe": "oui",
-      "moustache": "non",
-      "taille": "grande",
-      "corpulence": "fine",
-      "coupe_cheveux": "souvent un peu long",
-      "type cheveux": "lisse",
-      "teint": "clair",
-      "forme_visage": "ovale",
-      "sourcils": "normal",
-      "caracteristique" : "c'est une encyclopedie, il sait tout !"
+      "nez": "normal",
+      "levres": "moyennes"
     }
   }
 ]

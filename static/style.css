@@ -40,30 +40,46 @@ html, body {
 .topbar {
   flex: 0 0 auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 10px 16px;
+  gap: 6px 4px;
+  padding: 8px 12px;
   padding-top: calc(10px + env(safe-area-inset-top, 0px));
   background: var(--topbar-bg);
   box-shadow: 0 2px 12px rgba(0,0,0,.30);
   z-index: 10;
 }
 
+/* Paysage mobile : topbar compacte */
+@media (max-height: 500px) {
+  .topbar {
+    padding: 5px 12px;
+    padding-top: calc(5px + env(safe-area-inset-top, 0px));
+  }
+  .logo { font-size: 1.1rem; }
+  .badge-remaining { min-width: 26px; height: 26px; font-size: .8rem; }
+  .btn { padding: 5px 10px; font-size: .8rem; }
+}
+
 .topbar-left {
   display: flex;
   align-items: center;
   gap: 10px;
+  min-width: 0;
+  flex-shrink: 1;
 }
 
 .logo {
   margin: 0;
   font-family: "Bungee", impact, sans-serif;
-  font-size: 1.5rem;
+  font-size: 1rem;
   color: var(--accent);
   text-shadow: 2px 2px 0 rgba(0,0,0,.35);
   line-height: 1;
   letter-spacing: .02em;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .badge-remaining {
@@ -84,8 +100,10 @@ html, body {
 /* â”€â”€ Topbar actions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 .topbar-actions {
   display: flex;
-  gap: 7px;
+  gap: 6px;
   align-items: center;
+  flex-wrap: wrap;
+  flex-shrink: 1;
 }
 
 /* â”€â”€ Board backdrop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
@@ -116,8 +134,16 @@ html, body {
   display: flex;
   flex-direction: column;
   max-height: 80dvh;
+  height: 82dvh;
   transform: translateY(100%);
   transition: transform 300ms cubic-bezier(.32,1,.45,1);
+}
+
+/* Paysage mobile : écran court → ouvrir plus grand */
+@media (max-height: 500px) {
+  .board-drawer {
+    height: 92dvh;
+  }
 }
 .board-drawer.is-open {
   transform: translateY(0);
@@ -519,7 +545,8 @@ html, body {
   background: rgba(255,255,255,.14);
   color: #fff;
   border: 1.5px solid rgba(255,255,255,.28);
-  font-size: .75rem;
+  font-size: .72rem;
+  padding: 7px 11px;
 }
 
 .btn-send {

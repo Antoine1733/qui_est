@@ -10,6 +10,22 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Bungee&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+    <style>
+      /* Login modal */
+      .login-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 300; display: flex; align-items: center; justify-content: center; padding: 16px; }
+      .login-backdrop.hidden { display: none; }
+      .login-card { background: #fffef9; border-radius: 16px; box-shadow: 0 12px 40px rgba(0,0,0,.25); width: 100%; max-width: 380px; padding: 28px 24px; font-family: "Nunito", system-ui, sans-serif; }
+      .login-card h2 { margin: 0 0 4px; font-size: 1.5rem; font-family: "Bungee", impact, sans-serif; color: #ff6b35; }
+      .login-card p { margin: 0 0 18px; font-size: .88rem; color: #6b7c88; line-height: 1.5; }
+      .login-label { display: block; font-weight: 700; font-size: .85rem; margin-bottom: 4px; color: #1e2930; }
+      .login-input { width: 100%; padding: 10px 12px; border: 1.5px solid #d0c8be; border-radius: 8px; font-family: inherit; font-size: .95rem; outline: none; box-sizing: border-box; }
+      .login-input:focus { border-color: #ff6b35; }
+      .login-btn-main { width: 100%; padding: 11px; margin-top: 10px; background: #ff6b35; color: #fff; border: none; border-radius: 10px; font-family: inherit; font-weight: 800; font-size: 1rem; cursor: pointer; }
+      .login-btn-main:hover { background: #c94d18; }
+      .login-btn-skip { width: 100%; padding: 9px; margin-top: 8px; background: transparent; color: #6b7c88; border: 1.5px solid #d0c8be; border-radius: 10px; font-family: inherit; font-size: .88rem; cursor: pointer; }
+      .login-btn-skip:hover { color: #1e2930; border-color: #999; }
+      .login-error { color: #dc2626; font-size: .82rem; margin-top: 6px; min-height: 16px; }
+    </style>
   </head>
   <body>
     <!-- Board drawer (bottom sheet) – outside app-shell to avoid overflow clipping -->
@@ -34,16 +50,34 @@
     </div>
     <div id="board-backdrop" class="board-backdrop" aria-hidden="true"></div>
 
+    <!-- Login modal -->
+    <div id="login-backdrop" class="login-backdrop hidden">
+      <div class="login-card">
+        <h2>Qui&nbsp;Est&nbsp;?</h2>
+        <p>Connecte-toi pour gérer tes personnages et créer des liens partageables.<br>Ou joue directement avec les exemples.</p>
+        <label class="login-label" for="login-email-input">Adresse e-mail</label>
+        <input type="email" id="login-email-input" class="login-input" placeholder="toi@exemple.fr" autocomplete="email" />
+        <div id="login-error" class="login-error"></div>
+        <button class="login-btn-main" id="login-submit-btn">👤 Se connecter</button>
+        <button class="login-btn-skip" id="login-skip-btn">Jouer sans compte (exemples uniquement)</button>
+      </div>
+    </div>
+
     <div class="app-shell">
 
       <header class="topbar">
         <div class="topbar-left">
           <h1 class="logo">Qui&nbsp;Est&nbsp;?</h1>
-          <span class="badge-remaining" id="remaining-count" title="Profils restants">0</span>
         </div>
         <div class="topbar-actions">
-          <button id="board-toggle-btn" class="btn btn-ghost" type="button">👥 Photos</button>
-          <button id="new-game-btn" class="btn btn-ghost" type="button">↺ Nouvelle</button>
+          <button id="board-toggle-btn" class="btn btn-ghost" type="button">Photo : <span id="remaining-count">0</span> restants</button>
+          <button id="new-game-btn" class="btn btn-ghost" type="button">&#8635; Nouvelle</button>
+          {% if show_admin %}
+          <a href="/admin" class="btn btn-ghost" style="text-decoration:none" title="Gérer les personnages">⚙</a>
+          {% endif %}
+          {% if deployment_id and not show_admin %}
+          <a href="/" class="btn btn-ghost" style="text-decoration:none" title="Créer ton propre chatbot">✨ Crée ton propre chatbot</a>
+          {% endif %}
         </div>
       </header>
 
@@ -78,5 +112,15 @@
 
     </div>
     <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+    <!-- Game config injected before app.js runs -->
+    <script>
+      window.GAME_CONFIG = {
+        userEmail:      {{ user_email | tojson }},
+        showLoginModal: {{ 'true' if show_login_modal else 'false' }},
+        nextUrl:        {{ next_url | tojson }},
+        deploymentId:   {{ deployment_id | tojson }},
+        showAdmin:      {{ 'true' if show_admin else 'false' }},
+      };
+    </script>
   </body>
 </html>

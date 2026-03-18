@@ -5,12 +5,17 @@ import difflib
 import json
 import os
 import random
+import re
+import secrets
+import psycopg2
+import psycopg2.extras
 import unicodedata
 from pathlib import Path
 from typing import Any
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request, send_from_directory, session
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_from_directory, session
+from werkzeug.utils import secure_filename
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,7 +57,10 @@ load_env_file(ENV_FILE)
 
 
 CHARACTERS_FILE = BASE_DIR / "data" / "characters.json"
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 PHOTO_DIR = BASE_DIR / "photo"
+ALLOWED_PHOTO_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
+MAX_PHOTO_BYTES = 8 * 1024 * 1024  # 8 MB
 GROQ_ENDPOINT = os.getenv("GROQ_ENDPOINT", "https://api.groq.com/openai/v1/chat/completions")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
@@ -66,26 +74,223 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "change-me-in-production")
 
 with CHARACTERS_FILE.open("r", encoding="utf-8") as f:
-    CHARACTERS: list[dict[str, Any]] = json.load(f)
+    _JSON_CHARACTERS: list[dict[str, Any]] = json.load(f)
 
-CHARACTER_BY_ID = {character["id"]: character for character in CHARACTERS}
+
+# ── PostgreSQL helpers ───────────────────────────────────────────────────────
+
+class _PgConn:
+    """Thin shim making psycopg2 usable like sqlite3 in this codebase."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    def execute(self, sql: str, params=None):
+        self._cur.execute(sql, params)
+        return self._cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *_):
+        if exc_type:
+            self._conn.rollback()
+        else:
+            self._conn.commit()
+        self._conn.close()
+
+
+def get_db() -> _PgConn:
+    conn = psycopg2.connect(DATABASE_URL)
+    return _PgConn(conn)
+
+
+def init_db() -> None:
+    PHOTO_DIR.mkdir(exist_ok=True)
+    # Build a lookup from JSON for migration fallback
+    _json_map: dict[str, dict[str, Any]] = {c["id"]: c for c in _JSON_CHARACTERS}
+    with get_db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS characters (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                photo_filename TEXT,
+                attributes TEXT NOT NULL DEFAULT '{}',
+                is_preset INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deployments (
+                id TEXT PRIMARY KEY,
+                user_email TEXT NOT NULL,
+                character_ids TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS game_characters (
+                id TEXT NOT NULL,
+                deployment_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                photo_filename TEXT,
+                attributes TEXT NOT NULL DEFAULT '{}',
+                PRIMARY KEY (id, deployment_id),
+                FOREIGN KEY (deployment_id) REFERENCES deployments(id) ON DELETE CASCADE
+            )
+        """)
+
+        existing_preset_ids = {
+            row["id"] for row in conn.execute("SELECT id FROM characters WHERE is_preset=1")
+        }
+        json_ids = {char["id"] for char in _JSON_CHARACTERS}
+
+        # Remove preset characters that are no longer in characters.json
+        stale_ids = existing_preset_ids - json_ids
+        for stale_id in stale_ids:
+            conn.execute("DELETE FROM characters WHERE id=%s", (stale_id,))
+
+        # Clean up any non-preset chars from the global table (they belong only in game_characters)
+        conn.execute("DELETE FROM characters WHERE is_preset=0")
+
+        # Always sync ALL presets from JSON — presets are never deleted from the template library
+        for char in _JSON_CHARACTERS:
+            if char["id"] not in existing_preset_ids:
+                conn.execute(
+                    "INSERT INTO characters (id, name, photo_filename, attributes, is_preset) VALUES (%s,%s,%s,%s,1)",
+                    (
+                        char["id"],
+                        char["name"],
+                        char.get("photo"),
+                        json.dumps(char.get("attributes", {}), ensure_ascii=False),
+                    ),
+                )
+            else:
+                conn.execute(
+                    "UPDATE characters SET name=%s, attributes=%s WHERE id=%s AND is_preset=1",
+                    (
+                        char["name"],
+                        json.dumps(char.get("attributes", {}), ensure_ascii=False),
+                        char["id"],
+                    ),
+                )
+
+        deployments = conn.execute("SELECT id, character_ids FROM deployments").fetchall()
+        for dep in deployments:
+            dep_id = dep["id"]
+            try:
+                char_ids = json.loads(dep["character_ids"])
+            except (json.JSONDecodeError, TypeError):
+                char_ids = []
+            for cid in char_ids:
+                already = conn.execute(
+                    "SELECT 1 FROM game_characters WHERE id=%s AND deployment_id=%s", (cid, dep_id)
+                ).fetchone()
+                if already:
+                    continue
+                char_row = conn.execute(
+                    "SELECT name, photo_filename, attributes FROM characters WHERE id=%s", (cid,)
+                ).fetchone()
+                if char_row:
+                    conn.execute(
+                        "INSERT INTO game_characters (id, deployment_id, name, photo_filename, attributes) VALUES (%s,%s,%s,%s,%s)",
+                        (cid, dep_id, char_row["name"], char_row["photo_filename"], char_row["attributes"]),
+                    )
+                elif cid in _json_map:
+                    jc = _json_map[cid]
+                    conn.execute(
+                        "INSERT INTO game_characters (id, deployment_id, name, photo_filename, attributes) VALUES (%s,%s,%s,%s,%s)",
+                        (cid, dep_id, jc["name"], jc.get("photo"),
+                         json.dumps(jc.get("attributes", {}), ensure_ascii=False)),
+                    )
+
+        conn.commit()
+
+
+def load_characters_from_db() -> list[dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, photo_filename, attributes, is_preset FROM characters ORDER BY is_preset DESC, name"
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        char: dict[str, Any] = {
+            "id": row["id"],
+            "name": row["name"],
+            "attributes": json.loads(row["attributes"]),
+            "is_preset": bool(row["is_preset"]),
+        }
+        if row["photo_filename"]:
+            char["photo"] = row["photo_filename"]
+        else:
+            # Preset photos live in photo/ but aren't recorded in DB — resolve by name/id
+            for _ext in (".png", ".jpg", ".jpeg", ".webp"):
+                for _stem in (row["name"], row["id"]):
+                    _candidate = PHOTO_DIR / f"{_stem}{_ext}"
+                    if _candidate.exists():
+                        char["photo"] = _candidate.name
+                        break
+                if "photo" in char:
+                    break
+        result.append(char)
+    return result
+
+
+def reload_characters() -> None:
+    global CHARACTERS, CHARACTER_BY_ID
+    CHARACTERS = load_characters_from_db()
+    CHARACTER_BY_ID = {c["id"]: c for c in CHARACTERS}
+
+
+def load_game_characters(deployment_id: str) -> list[dict[str, Any]]:
+    """Load characters specific to a deployment from the game_characters table."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT gc.id, gc.name, gc.photo_filename, gc.attributes,
+                      CASE WHEN c.id IS NOT NULL THEN 1 ELSE 0 END as is_preset
+               FROM game_characters gc
+               LEFT JOIN characters c ON gc.id = c.id
+               WHERE gc.deployment_id = %s ORDER BY gc.name""",
+            (deployment_id,),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        char: dict[str, Any] = {
+            "id": row["id"],
+            "name": row["name"],
+            "attributes": json.loads(row["attributes"]),
+            "is_preset": bool(row["is_preset"]),
+        }
+        if row["photo_filename"]:
+            char["photo"] = row["photo_filename"]
+        else:
+            # Fallback: look for photo file by name/id stem
+            for _ext in (".png", ".jpg", ".jpeg", ".webp"):
+                for _stem in (row["name"], row["id"]):
+                    _candidate = PHOTO_DIR / f"{_stem}{_ext}"
+                    if _candidate.exists():
+                        char["photo"] = _candidate.name
+                        break
+                if "photo" in char:
+                    break
+        result.append(char)
+    return result
+
+
+# Bootstrap
+init_db()
+CHARACTERS: list[dict[str, Any]] = []
+CHARACTER_BY_ID: dict[str, dict[str, Any]] = {}
+reload_characters()
 
 
 def normalize_text(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text.lower())
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
 
-
-# Global vocabulary: maps every normalized value-word (≥3 chars) to the attribute key
-# it belongs to, built across ALL characters.
-# Example: "lisse" → "type cheveux"  (because Loli has "type cheveux": "souvent lisse…")
-# This lets us answer "lisse ?" for Victoria even though "lisse" is not in her own values.
-_GLOBAL_VALUE_VOCAB: dict[str, str] = {}
-for _char in CHARACTERS:
-    for _k, _v in _char.get("attributes", {}).items():
-        for _word in normalize_text(str(_v)).split():
-            if len(_word) >= 3 and _word not in _GLOBAL_VALUE_VOCAB:
-                _GLOBAL_VALUE_VOCAB[_word] = _k
 
 def is_hint_request(question: str) -> bool:
     q = normalize_text(question)
@@ -116,8 +321,10 @@ def is_identity_request(question: str) -> bool:
 def is_character_name_guess(question: str) -> bool:
     """Returns True if the question is just a character name (a direct guess typed in the chat)."""
     q = normalize_text(question).strip().strip("!?.,;: ")
-    all_names = {normalize_text(c["name"]) for c in CHARACTERS}
-    all_ids = {normalize_text(c["id"]) for c in CHARACTERS}
+    deployment_id = session.get("deployment_id")
+    chars = load_game_characters(deployment_id) if deployment_id else CHARACTERS
+    all_names = {normalize_text(c["name"]) for c in chars}
+    all_ids = {normalize_text(c["id"]) for c in chars}
     return q in all_names or q in all_ids
 
 
@@ -240,25 +447,25 @@ def resolve_photo_path(character: dict[str, Any]) -> Path | None:
     if not PHOTO_DIR.exists():
         return None
 
+    _PHOTO_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
     explicit_photo = str(character.get("photo", "")).strip()
     if explicit_photo:
         explicit_path = PHOTO_DIR / explicit_photo
-        if explicit_path.exists() and explicit_path.suffix.lower() == ".png":
+        if explicit_path.exists() and explicit_path.suffix.lower() in _PHOTO_EXTS:
             return explicit_path
 
-    candidate_paths = [
-        PHOTO_DIR / f"{character['name']}.png",
-        PHOTO_DIR / f"{character['id']}.png",
-    ]
-    for candidate_path in candidate_paths:
-        if candidate_path.exists():
-            return candidate_path
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        for stem in (character["name"], character["id"]):
+            candidate_path = PHOTO_DIR / f"{stem}{ext}"
+            if candidate_path.exists():
+                return candidate_path
 
-    png_files = [path for path in PHOTO_DIR.iterdir() if path.is_file() and path.suffix.lower() == ".png"]
-    if not png_files:
+    photo_files = [path for path in PHOTO_DIR.iterdir() if path.is_file() and path.suffix.lower() in _PHOTO_EXTS]
+    if not photo_files:
         return None
 
-    photo_by_stem = {normalize_stem(path.stem): path for path in png_files}
+    photo_by_stem = {normalize_stem(path.stem): path for path in photo_files}
     for source in (character.get("name", ""), character.get("id", ""), explicit_photo):
         normalized_source = normalize_stem(str(source))
         if not normalized_source:
@@ -291,6 +498,22 @@ def get_secret_character() -> dict[str, Any] | None:
     secret_id = session.get("secret_character_id")
     if not secret_id:
         return None
+    deployment_id = session.get("deployment_id")
+    if deployment_id:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT id, name, photo_filename, attributes FROM game_characters WHERE id=%s AND deployment_id=%s",
+                (secret_id, deployment_id),
+            ).fetchone()
+        if row:
+            char: dict[str, Any] = {
+                "id": row["id"],
+                "name": row["name"],
+                "attributes": json.loads(row["attributes"]),
+            }
+            if row["photo_filename"]:
+                char["photo"] = row["photo_filename"]
+            return char
     return CHARACTER_BY_ID.get(secret_id)
 
 
@@ -301,145 +524,61 @@ def start_new_game() -> None:
     session["question_count"] = 0
 
 
-def find_matching_attribute(question: str, attributes: dict[str, Any]) -> tuple[str, Any] | None:
-    """Returns (key, value) of the attribute that best matches the question intent.
-
-    Strategy: value-matches are tried FIRST (more specific / intent-aligned),
-    then key-only matches, then the global vocab fallback.  This avoids
-    'cheveux bouclé ?' matching the generic key 'cheveux' (→ colour) instead of
-    the value 'bouclés' in 'type cheveux'.
-    """
-    q_tokens = [t for t in normalize_text(question).split() if len(t) >= 3]
-    if not q_tokens:
-        return None
-
-    # Separate indices: value words and key words
-    value_word_to_attr: dict[str, tuple[str, Any]] = {}
-    key_word_to_attr:   dict[str, tuple[str, Any]] = {}
-
-    for k, v in attributes.items():
-        nk = normalize_text(k)
-        # index key words
-        for word in nk.split():
-            if word not in key_word_to_attr:
-                key_word_to_attr[word] = (k, v)
-        if nk not in key_word_to_attr:
-            key_word_to_attr[nk] = (k, v)
-        # index value words
-        for word in normalize_text(str(v)).split():
-            if len(word) >= 3 and word not in value_word_to_attr:
-                value_word_to_attr[word] = (k, v)
-
-    # Pass 1 — value-word match (most specific)
-    for token in q_tokens:
-        if token in value_word_to_attr:
-            return value_word_to_attr[token]
-        close = difflib.get_close_matches(token, value_word_to_attr.keys(), n=1, cutoff=0.75)
-        if close:
-            return value_word_to_attr[close[0]]
-
-    # Pass 2 — key-word match
-    for token in q_tokens:
-        if token in key_word_to_attr:
-            return key_word_to_attr[token]
-        close = difflib.get_close_matches(token, key_word_to_attr.keys(), n=1, cutoff=0.75)
-        if close:
-            return key_word_to_attr[close[0]]
-
-    # Pass 3 — global vocab fallback: token seen as VALUE on another character
-    #           → map to the same key on THIS character
-    for token in q_tokens:
-        candidate_key = _GLOBAL_VALUE_VOCAB.get(token)
-        if candidate_key is None:
-            gm = difflib.get_close_matches(token, _GLOBAL_VALUE_VOCAB.keys(), n=1, cutoff=0.75)
-            if gm:
-                candidate_key = _GLOBAL_VALUE_VOCAB[gm[0]]
-        if candidate_key is not None:
-            for k, v in attributes.items():
-                if normalize_text(k) == normalize_text(candidate_key):
-                    return (k, v)
-
-    return None
-
-
-def question_maps_to_attribute(question: str, attributes: dict[str, Any]) -> bool:
-    return find_matching_attribute(question, attributes) is not None
-
-
-def answer_directly_from_attr(question: str, key: str, value: Any) -> str:
-    """Deterministically answer a yes/no question from a confirmed attribute — no LLM needed.
-
-    Rules:
-    - value "oui" / "non" → "Oui." / "Non."
-    - a question token appears in the value words → nuanced value (if multi-word) or "Oui."
-    - no token found in value → "Non."
-    """
-    v_str = str(value).strip()
-    v_norm = normalize_text(v_str)
-
-    if v_norm == "oui":
-        return "Oui."
-    if v_norm == "non":
-        return "Non."
-
-    q_tokens = [t for t in normalize_text(question).split() if len(t) >= 3]
-    v_words = v_norm.split()
-
-    for token in q_tokens:
-        if token in v_words:
-            return v_str if len(v_words) > 1 else "Oui."
-        if difflib.get_close_matches(token, v_words, n=1, cutoff=0.80):
-            return v_str if len(v_words) > 1 else "Oui."
-
-    # Question token absent from value → the attribute value doesn't match → Non.
-    return "Non."
-
-
 def classify_and_answer_with_attributes(
     question: str,
     attributes: dict[str, Any],
     *,
     hint_requested: bool,
 ) -> tuple[str, str, str]:
-    # Find a confirmed attribute match BEFORE calling the LLM.
-    matched_attr = find_matching_attribute(question, attributes)
-
-    # When we have a confirmed match and this is NOT a hint request,
-    # answer deterministically — no LLM call, no hallucination possible.
-    if matched_attr and not hint_requested:
-        key, value = matched_attr
-        answer = answer_directly_from_attr(question, key, value)
-        return "answer_from_attributes", answer, "direct-match"
-
+    attribute_keys = list(attributes.keys())
     system_prompt = (
-        "Tu es l'arbitre d'un jeu Qui Est. "
-        "REGLE ABSOLUE : tu utilises EXCLUSIVEMENT les attributs JSON fournis. "
-        "Il est STRICTEMENT INTERDIT d'inventer, deviner ou deduire une information "
-        "qui ne figure pas explicitement dans les attributs. "
-        "Reponds STRICTEMENT en JSON avec ce schema: "
-        '{"decision":"answer_from_attributes|need_photo|unknown|smalltalk|single_hint","answer":"..."}. '
-        "Regles: "
-        "1) decision=smalltalk si c'est une salutation ou message social (bonjour, salut, etc.). "
-        "Dans ce cas, answer NE DOIT DONNER AUCUN indice. "
-        "2) Si demande_indice_explicite=false, il est strictement interdit de donner un indice gratuit. "
-        "3) decision=single_hint UNIQUEMENT si demande_indice_explicite=true. "
-        "Dans ce cas, answer contient EXACTEMENT UN SEUL indice base sur UN seul attribut. "
-        "4) decision=answer_from_attributes UNIQUEMENT si la cle d'attribut correspondante est "
-        "EXPLICITEMENT PRESENTE dans le JSON. Si la cle est absente, ne pas utiliser cette decision. "
-        "Interprete les formulations telegraphiques (ex: 'cheveux blond ?') comme des questions binaires. "
-        "Tolere les fautes de frappe courantes (ex: 'cheveyx' pour 'cheveux'). "
-        "5) decision=need_photo si la question porte sur quelque chose de VISUEL ou VESTIMENTAIRE "
-        "absent des attributs. Sont considerees comme visuelles/vestimentaires : "
-        "vetements (pull, chemise, couleur vetement, tenue, veste, haut, bas, robe...), "
-        "couleur de peau, silhouette precise, posture, expression, detail physique fin non liste. "
-        "En cas de doute entre need_photo et unknown, privilegier need_photo. "
-        "6) decision=unknown UNIQUEMENT si la question ne porte pas du tout sur le physique ou les vetements "
-        "et que l'attribut correspondant est absent."
-        "7) Pour une question avec decision=answer_from_attributes: "
-        "   - Si la valeur de l'attribut est clairement oui/non, commence answer par 'Oui.' ou 'Non.'. "
-        "   - Si la valeur est nuancee (ex: 'parfois', 'souvent', 'oui pour lire', 'entre X et Y'), "
-        "     reponds fidelement cette valeur sans forcer Oui/Non. "
-        "8) Si decision=unknown, answer doit etre: 'Information non disponible dans les attributs.'"
+        "Tu es l'arbitre d'un jeu Qui Est-ce que c'est.\n"
+        "Tu recois une question du joueur et les attributs JSON du personnage secret.\n"
+        "Reponds STRICTEMENT en JSON avec ces trois champs :\n"
+        '{"sujet": "le nom/sujet principal de la question, ou \"aucun\" si la question ne contient que des adjectifs/couleurs sans nom",'
+        '"decision":"answer_from_attributes|need_photo|smalltalk|single_hint|clarify","answer":"..."}\n'
+        "\n"
+        "ETAPE 1 — Identifie le SUJET de la question et ecris-le dans le champ 'sujet'.\n"
+        "  Un SUJET est un NOM (chose, partie du corps, vetement, lieu…).\n"
+        "  sujet='aucun' si la question ne contient QUE des adjectifs ou couleurs sans nom.\n"
+        "  Exemples :\n"
+        "    'pull rouge' → sujet='pull'\n"
+        "    'yeux bleus' → sujet='yeux'\n"
+        "    'ciel bleu' → sujet='ciel'\n"
+        "    'cheveux roux' → sujet='cheveux'\n"
+        "    'rouge' → sujet='aucun'\n"
+        "    'bleu' → sujet='aucun'\n"
+        "    'orange' → sujet='aucun'\n"
+        "    'grand' → sujet='aucun'\n"
+        "\n"
+        "ETAPE 2 — Choisis la decision selon cet arbre :\n"
+        "  a) Salutation/social → smalltalk.\n"
+        "  b) demande_indice_explicite=true → single_hint.\n"
+        "  c) sujet='aucun' → clarify, answer=question courte ex: 'Rouge pour quoi ? Les cheveux, les yeux, les vetements, autre chose ?'\n"
+        f"  d) sujet present dans les cles {attribute_keys} (ou variante/faute de frappe proche) → answer_from_attributes.\n"
+        "     REGLE TYPE DE QUESTION :\n"
+        "     - La question contient UN ADJECTIF/COULEUR en plus du sujet → TOUJOURS binaire → 'Oui.' ou 'Non.'\n"
+        "       ex: 'cheveux rouge ?' avec cheveux=brun → 'Non.' (pas 'Brun.')\n"
+        "       ex: 'yeux bleus ?' avec yeux=bleu → 'Oui.'\n"
+        "       ex: 'grande taille ?' avec taille=grande → 'Oui.'\n"
+        "     - La question ne contient que le sujet sans adjectif → ouverte → valeur de l'attribut.\n"
+        "       ex: 'couleur cheveux ?' avec cheveux=brun → 'Brun.'\n"
+        "       ex: 'homme ou femme ?' avec genre=homme → 'Homme.'\n"
+        "     - Booleen : lunettes=oui → 'Oui.' ; lunettes=non → 'Non.'\n"
+        "  d bis) sujet ABSENT des cles MAIS est un ADJECTIF/VALEUR qui qualifie implicitement un attribut\n"
+        "     (couleur de cheveux, genre, taille, corpulence, etc.),\n"
+        "     y compris si CE PERSONNAGE n'a pas cette valeur (ex: 'blond' mais cheveux=brun)\n"
+        "     → answer_from_attributes. Utilise le NOM DE LA CLE correspondante comme 'sujet'.\n"
+        "     La reponse est TOUJOURS binaire : 'Oui.' si la valeur reelle correspond, 'Non.' sinon.\n"
+        "     ex: question='homme ?' et genre=homme → sujet='genre', answer='Oui.'\n"
+        "     ex: question='homme ?' et genre=femme → sujet='genre', answer='Non.'\n"
+        "     ex: question='blond ?' et cheveux=brun → sujet='cheveux', answer='Non.'\n"
+        "     ex: question='blond ?' et cheveux=blond → sujet='cheveux', answer='Oui.'\n"
+        "     ex: question='feme ?' (faute) et genre=femme → sujet='genre', answer='Oui.'\n"
+        "     ex: question='grande ?' et taille=grand → sujet='taille', answer='Oui.'\n"
+        "     ex: question='mince ?' et corpulence=mince → sujet='corpulence', answer='Oui.'\n"
+        "  e) sujet identifie mais ABSENT des cles ET ABSENT des valeurs → need_photo.\n"
+        "     JAMAIS repondre 'Non.' par deduction. Absence de cle ET de valeur = need_photo."
     )
 
     user_payload: dict[str, Any] = {
@@ -458,30 +597,48 @@ def classify_and_answer_with_attributes(
     )
 
     if raw_answer is None:
-        return "unknown", build_llm_error_message(provider, for_vision=False), provider
+        return "need_photo", build_llm_error_message(provider, for_vision=False), provider
 
     parsed = extract_first_json_object(raw_answer)
     if parsed is None:
-        normalized_raw = normalize_text(raw_answer)
-        if "smalltalk" in normalized_raw:
-            return "smalltalk", SMALLTALK_REPLY, "llm-router"
-        if "single_hint" in normalized_raw:
-            return "single_hint", sanitize_single_hint(raw_answer), "llm-router"
-        if "need_photo" in normalized_raw:
-            return "need_photo", "Information non disponible dans les attributs.", "llm-router"
-        if "information non disponible" in normalized_raw:
-            return "unknown", "Information non disponible dans les attributs.", "llm-router"
-        return "unknown", "Information non disponible dans les attributs.", "llm-router"
+        return "need_photo", "", "llm-router"
 
     decision = str(parsed.get("decision", "")).strip().lower()
     answer = str(parsed.get("answer", "")).strip()
+    sujet = str(parsed.get("sujet", "")).strip().lower()
 
-    if decision not in {"answer_from_attributes", "need_photo", "unknown", "smalltalk", "single_hint"}:
-        decision = "unknown"
+    if decision not in {"answer_from_attributes", "need_photo", "smalltalk", "single_hint", "clarify"}:
+        decision = "need_photo"
 
-    # Sanity check: if LLM claims answer_from_attributes but no question token
-    # maps to any attribute, it's hallucinating → redirect to need_photo.
-    if decision == "answer_from_attributes" and not matched_attr:
+    # Safety: if the LLM identified a real subject but still returned clarify, override to need_photo.
+    if decision == "clarify" and sujet and sujet != "aucun":
+        decision = "need_photo"
+        answer = ""
+
+    # Safety: if the LLM returned answer_from_attributes but the identified subject is NOT
+    # in the attribute keys, override to need_photo (e.g. sujet="pull" with no "pull" key).
+    # Exception: if sujet is a VALUE that exists anywhere across all characters (e.g. sujet="blond"
+    # even if THIS character has cheveux="brun"), the LLM is handling a value-as-question.
+    if decision == "answer_from_attributes" and sujet and sujet != "aucun":
+        normalized_sujet = normalize_text(sujet)
+        normalized_keys = [normalize_text(k) for k in attributes.keys()]
+        all_values_global = [normalize_text(str(v)) for c in CHARACTERS for v in c.get("attributes", {}).values()]
+        sujet_in_keys = any(
+            normalized_sujet in k or k in normalized_sujet or
+            difflib.get_close_matches(normalized_sujet, normalized_keys, n=1, cutoff=0.75)
+            for k in normalized_keys
+        )
+        sujet_is_known_value = bool(
+            normalized_sujet in all_values_global or
+            difflib.get_close_matches(normalized_sujet, list(set(all_values_global)), n=1, cutoff=0.75)
+        )
+        if not sujet_in_keys and not sujet_is_known_value:
+            decision = "need_photo"
+            answer = ""
+
+    # Safety: if the LLM returned smalltalk but the question is NOT a real social greeting
+    # (e.g. "le ciel est bleu ?"), redirect to need_photo so the photo is analysed.
+    if decision == "smalltalk" and not is_smalltalk(question):
         decision = "need_photo"
         answer = ""
 
@@ -490,76 +647,32 @@ def classify_and_answer_with_attributes(
             answer = SMALLTALK_REPLY
         elif decision == "single_hint":
             answer = "Indice: information non disponible dans les attributs."
-        else:
-            answer = "Information non disponible dans les attributs."
 
     if decision == "smalltalk":
-        answer = SMALLTALK_REPLY
+        answer = answer or SMALLTALK_REPLY
     elif decision == "single_hint":
         answer = sanitize_single_hint(answer)
+    elif decision == "clarify" and not answer:
+        answer = "Peux-tu preciser ta question ? (ex: de quoi parles-tu exactement ?)"
 
     return decision, answer, "llm-router"
 
 
-def recover_unknown_with_attributes(question: str, attributes: dict[str, Any]) -> tuple[bool, str, str]:
-    """Second LLM pass to recover short or typo-heavy questions without hardcoded rules."""
-    system_prompt = (
-        "Tu es un resolveur de question pour Qui Est. "
-        "REGLE ABSOLUE : utilise EXCLUSIVEMENT les attributs JSON fournis. "
-        "Il est STRICTEMENT INTERDIT d'inventer, deviner ou deduire une information "
-        "qui ne figure pas explicitement dans les attributs. "
-        "Meme si la question porte sur quelque chose de logique ou probable, "
-        "si la cle n'est pas dans le JSON, can_answer doit etre false. "
-        "Interprete les formulations telegraphiques et fautes de frappe (ex: 'cheveyx blond ?'). "
-        "Reponds STRICTEMENT en JSON avec ce schema: "
-        '{"can_answer":true|false,"answer":"..."}. '
-        "can_answer=true UNIQUEMENT si la cle d'attribut correspondante est PRESENTE dans le JSON. "
-        "Si can_answer=true: "
-        "  - Si la valeur de l'attribut est clairement oui/non, commence answer par 'Oui.' ou 'Non.'. "
-        "  - Si la valeur est nuancee (ex: 'parfois', 'souvent', 'oui pour lire', 'entre X et Y'), "
-        "    reponds fidelement cette valeur sans forcer Oui/Non. "
-        "Si can_answer=false, answer doit etre exactement: 'Information non disponible dans les attributs.'"
-    )
 
-    payload = {
-        "question": question,
-        "attributs_personnage_secret": attributes,
-    }
 
-    raw_answer, provider = call_llm_completion(
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-        model=GROQ_MODEL,
-        timeout=30,
-    )
-
-    if raw_answer is None:
-        return False, build_llm_error_message(provider, for_vision=False), provider
-
-    parsed = extract_first_json_object(raw_answer)
-    if parsed is None:
-        normalized = normalize_text(raw_answer)
-        if normalized.startswith("oui") or normalized.startswith("non"):
-            return True, raw_answer.strip(), "llm-recovery"
-        if "information non disponible" in normalized:
-            return False, "Information non disponible dans les attributs.", "llm-recovery"
-        return False, "Information non disponible dans les attributs.", "llm-recovery"
-
-    can_answer = bool(parsed.get("can_answer", False))
-    answer = str(parsed.get("answer", "")).strip() or "Information non disponible dans les attributs."
-    return can_answer, answer, "llm-recovery"
+_MIME_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 
 
 def call_photo_llm(question: str, photo_path: Path | None) -> tuple[str, str]:
     if photo_path is None:
-        return "Je n'ai pas trouve de photo PNG associee a cette personne.", "vision-unavailable"
+        return "Je n'ai pas trouve de photo associee a cette personne.", "vision-unavailable"
 
     try:
         encoded_image = base64.b64encode(photo_path.read_bytes()).decode("ascii")
     except OSError:
-        return "Je n'arrive pas a lire la photo PNG associee.", "vision-unavailable"
+        return "Je n'arrive pas a lire la photo associee.", "vision-unavailable"
+
+    mime_type = _MIME_BY_EXT.get(photo_path.suffix.lower(), "image/png")
 
     system_prompt = (
         "Tu es l'arbitre du jeu Qui Est. "
@@ -584,12 +697,12 @@ def call_photo_llm(question: str, photo_path: Path | None) -> tuple[str, str]:
                         "text": (
                             "Question: "
                             f"{question}\n"
-                            "Analyse cette photo PNG et reponds uniquement d'apres ce qui est visible."
+                            "Analyse cette photo et reponds uniquement d'apres ce qui est visible."
                         ),
                     },
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{encoded_image}"},
+                        "image_url": {"url": f"data:{mime_type};base64,{encoded_image}"},
                     },
                 ],
             },
@@ -618,37 +731,6 @@ NAME_GUESS_REPLY = (
 )
 
 
-def is_clothing_question(question: str) -> bool:
-    """Returns True if the question is clearly about clothing/outfit — must go to the photo.
-    Rules:
-    - A clothing noun alone → photo (ex: "tshirt blanc ?", "pull ?")
-    - "porte" / "portait" alone → photo (ex: "porte un chapeau ?")
-    - A color word alone does NOT trigger photo (ex: "yeux bleu ?" → attributes)
-    - A color word + clothing noun → photo (ex: "veste rouge ?")
-    """
-    q = normalize_text(question)
-    q_tokens = set(q.split())
-
-    clothing_nouns = {
-        "tshirt", "chemise", "pull", "gilet", "veste", "manteau", "blouson",
-        "sweat", "hoodie", "polo", "pantalon", "jean", "short",
-        "jupe", "robe", "costume", "cravate", "noeud", "echarpe",
-        "casquette", "bonnet", "tenue", "vetement", "habit",
-    }
-    porter_verbs = {"porte", "portait", "porter"}
-    color_words = {
-        "blanc", "blanche", "noire", "noir", "rouge", "verte", "vert",
-        "jaune", "gris", "grise", "rose", "orange", "violet", "violette",
-        "beige", "rayure", "rayures", "carreaux",
-    }
-
-    has_clothing = bool(q_tokens & clothing_nouns)
-    has_porter = bool(q_tokens & porter_verbs)
-    has_color = bool(q_tokens & color_words)
-
-    return has_clothing or has_porter or (has_color and has_clothing)
-
-
 def answer_question(question: str, character: dict[str, Any]) -> tuple[str, str, str | None]:
     attributes = character.get("attributes", {})
 
@@ -661,37 +743,22 @@ def answer_question(question: str, character: dict[str, Any]) -> tuple[str, str,
     if is_smalltalk(question) and not is_hint_request(question):
         return SMALLTALK_REPLY, "conversation-guard", None
 
-    # Short-circuit: clothing/appearance questions always go to the photo,
-    # no LLM routing needed — prevents hallucination on vestimentary attrs.
-    if is_clothing_question(question) and not is_hint_request(question):
-        photo_answer, photo_provider = call_photo_llm(question, resolve_photo_path(character))
-        return photo_answer, photo_provider, PHOTO_ANALYSIS_NOTICE
+    q_norm = normalize_text(question)
+    if any(token in q_norm for token in ("prenom", "s appelle", "appelle-t-il", "appelle-t-elle", "comment il s", "comment elle s")):
+        return "On ne peut pas poser de questions sur le prénom.", "conversation-guard", None
 
-    decision, attribute_answer, provider = classify_and_answer_with_attributes(
+    decision, answer, provider = classify_and_answer_with_attributes(
         question,
         attributes,
         hint_requested=is_hint_request(question),
     )
 
-    if decision in {"smalltalk", "single_hint"}:
-        return attribute_answer, provider, None
+    if decision in {"smalltalk", "single_hint", "answer_from_attributes", "clarify"}:
+        return answer, provider, None
 
-    if decision == "answer_from_attributes":
-        return attribute_answer, provider, None
-
-    if decision == "need_photo":
-        photo_answer, photo_provider = call_photo_llm(question, resolve_photo_path(character))
-        return photo_answer, photo_provider, PHOTO_ANALYSIS_NOTICE
-
-    if decision == "unknown":
-        recovered, recovered_answer, recovered_provider = recover_unknown_with_attributes(question, attributes)
-        if recovered:
-            return recovered_answer, recovered_provider, None
-        # Attribut absent et non-récupérable → tenter la photo comme dernier recours
-        photo_answer, photo_provider = call_photo_llm(question, resolve_photo_path(character))
-        return photo_answer, photo_provider, PHOTO_ANALYSIS_NOTICE
-
-    return attribute_answer, provider, None
+    # need_photo: LLM determined info is absent or visual → analyze the photo
+    photo_answer, photo_provider = call_photo_llm(question, resolve_photo_path(character))
+    return photo_answer, photo_provider, PHOTO_ANALYSIS_NOTICE
 
 
 def render_avatar_svg(character: dict[str, Any]) -> str:
@@ -796,15 +863,41 @@ def render_avatar_svg(character: dict[str, Any]) -> str:
 
 @app.get("/")
 def index() -> str:
-    return render_template("index.html")
+    show_login = not session.get("user_email") or request.args.get("login") == "required"
+    return render_template(
+        "index.html",
+        user_email=session.get("user_email", ""),
+        show_login_modal=show_login,
+        next_url=request.args.get("next", ""),
+        deployment_id="",
+        show_admin=True,
+    )
 
 
 @app.get("/api/new-game")
 def new_game() -> Response:
+    deployment_id = request.args.get("d", "").strip()
+    if deployment_id:
+        with get_db() as conn:
+            row = conn.execute("SELECT id FROM deployments WHERE id=%s", (deployment_id,)).fetchone()
+        if not row:
+            return jsonify({"error": "Lien de jeu introuvable."}), 404
+        chars = load_game_characters(deployment_id)
+        if not chars:
+            return jsonify({"error": "Aucun personnage dans ce déploiement."}), 404
+        secret = random.choice(chars)
+        session["secret_character_id"] = secret["id"]
+        session["deployment_id"] = deployment_id
+        session["game_active"] = True
+        session["question_count"] = 0
+        shuffled = chars[:]
+        random.shuffle(shuffled)
+        return jsonify({"characters": [serialize_character(c) for c in shuffled], "message": "Nouvelle partie lancée"})
+    session.pop("deployment_id", None)
+    reload_characters()
     start_new_game()
     shuffled = CHARACTERS[:]
     random.shuffle(shuffled)
-
     return jsonify(
         {
             "characters": [serialize_character(character) for character in shuffled],
@@ -871,8 +964,503 @@ def photo(filename: str) -> Response:
 def avatar(character_id: str) -> Response:
     character = CHARACTER_BY_ID.get(character_id)
     if character is None:
-        return Response("Unknown character", status=404)
+        # Custom char not in global presets — try game_characters using session deployment
+        deployment_id = session.get("deployment_id")
+        if deployment_id:
+            with get_db() as conn:
+                row = conn.execute(
+                    "SELECT id, name, attributes FROM game_characters WHERE id=%s AND deployment_id=%s",
+                    (character_id, deployment_id),
+                ).fetchone()
+            if row:
+                character = {"id": row["id"], "name": row["name"],
+                             "attributes": json.loads(row["attributes"])}
+        if character is None:
+            # Generic fallback: render an avatar with just the id for color seeding
+            character = {"id": character_id, "name": character_id, "attributes": {}}
     return Response(render_avatar_svg(character), mimetype="image/svg+xml")
+
+
+# ── Admin routes ──────────────────────────────────────────────────────────────
+
+@app.get("/admin")
+def admin_page() -> Response | str:
+    email = session.get("user_email")
+    if not email:
+        return redirect("/?login=required&next=/admin")
+    return render_template("admin.html", characters=load_characters_from_db(), user_email=email)
+
+
+@app.post("/api/admin/characters")
+def admin_add_character() -> Response:
+    name = str(request.form.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "Le nom est requis."}), 400
+
+    # Generate a URL-safe unique ID from the name
+    base_id = re.sub(r"[^a-z0-9]+", "-", normalize_text(name)).strip("-")
+    if not base_id:
+        base_id = "personnage"
+    character_id = base_id
+    with get_db() as conn:
+        suffix = 1
+        while conn.execute("SELECT 1 FROM characters WHERE id=%s", (character_id,)).fetchone():
+            character_id = f"{base_id}-{suffix}"
+            suffix += 1
+
+    # Handle photo upload
+    photo_filename = None
+    photo_file = request.files.get("photo")
+    if photo_file and photo_file.filename:
+        ext = photo_file.filename.rsplit(".", 1)[-1].lower() if "." in photo_file.filename else ""
+        if ext not in ALLOWED_PHOTO_EXTENSIONS:
+            return jsonify({"error": f"Format non supporté. Acceptés : {', '.join(sorted(ALLOWED_PHOTO_EXTENSIONS))}"}), 400
+        file_bytes = photo_file.read()
+        if len(file_bytes) > MAX_PHOTO_BYTES:
+            return jsonify({"error": "Photo trop grande (max 8 Mo)."}), 400
+        safe_name = secure_filename(f"{character_id}.{ext}")
+        PHOTO_DIR.mkdir(exist_ok=True)
+        (PHOTO_DIR / safe_name).write_bytes(file_bytes)
+        photo_filename = safe_name
+
+    # Parse attributes JSON
+    try:
+        attributes_raw = str(request.form.get("attributes", "{}")).strip() or "{}"
+        attributes = json.loads(attributes_raw)
+        if not isinstance(attributes, dict):
+            raise ValueError("attributes must be a JSON object")
+    except (json.JSONDecodeError, ValueError):
+        return jsonify({"error": "Format d'attributs invalide (JSON attendu)."}), 400
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO characters (id, name, photo_filename, attributes, is_preset) VALUES (%s,%s,%s,%s,0)",
+            (character_id, name, photo_filename, json.dumps(attributes, ensure_ascii=False)),
+        )
+        conn.commit()
+
+    reload_characters()
+    return jsonify({"success": True, "id": character_id, "name": name,
+                    "photo": photo_filename, "attributes": attributes, "is_preset": False}), 201
+
+
+@app.delete("/api/admin/characters/<character_id>")
+def admin_delete_character(character_id: str) -> Response:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT is_preset, photo_filename FROM characters WHERE id=%s", (character_id,)
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Personnage introuvable."}), 404
+        if bool(row["is_preset"]):
+            return jsonify({"error": "Les personnages préenregistrés ne peuvent pas être supprimés de la bibliothèque."}), 403
+        # Cascade: remove from ALL games that have this character
+        conn.execute("DELETE FROM game_characters WHERE id=%s", (character_id,))
+        conn.execute("DELETE FROM characters WHERE id=%s", (character_id,))
+        # Delete photo file (no more references after cascade)
+        if row["photo_filename"]:
+            photo_path = PHOTO_DIR / row["photo_filename"]
+            if photo_path.exists():
+                photo_path.unlink(missing_ok=True)
+        conn.commit()
+
+    reload_characters()
+    return jsonify({"success": True})
+
+
+@app.post("/api/admin/characters/<character_id>/edit")
+def admin_edit_character(character_id: str) -> Response:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT photo_filename FROM characters WHERE id=%s", (character_id,)
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Personnage introuvable."}), 404
+
+        # Handle photo upload
+        photo_filename = row["photo_filename"]
+        photo_file = request.files.get("photo")
+        if photo_file and photo_file.filename:
+            ext = photo_file.filename.rsplit(".", 1)[-1].lower() if "." in photo_file.filename else ""
+            if ext not in ALLOWED_PHOTO_EXTENSIONS:
+                return jsonify({"error": f"Format non supporté. Acceptés : {', '.join(sorted(ALLOWED_PHOTO_EXTENSIONS))}"}), 400
+            file_bytes = photo_file.read()
+            if len(file_bytes) > MAX_PHOTO_BYTES:
+                return jsonify({"error": "Photo trop grande (max 8 Mo)."}), 400
+            # Remove old photo if different
+            if photo_filename and (PHOTO_DIR / photo_filename).exists():
+                (PHOTO_DIR / photo_filename).unlink(missing_ok=True)
+            safe_name = secure_filename(f"{character_id}.{ext}")
+            PHOTO_DIR.mkdir(exist_ok=True)
+            (PHOTO_DIR / safe_name).write_bytes(file_bytes)
+            photo_filename = safe_name
+
+        # Parse attributes
+        try:
+            attributes_raw = str(request.form.get("attributes", "{}")).strip() or "{}"
+            attributes = json.loads(attributes_raw)
+            if not isinstance(attributes, dict):
+                raise ValueError
+        except (json.JSONDecodeError, ValueError):
+            return jsonify({"error": "Format d'attributs invalide (JSON attendu)."}), 400
+
+        conn.execute(
+            "UPDATE characters SET photo_filename=%s, attributes=%s WHERE id=%s",
+            (photo_filename, json.dumps(attributes, ensure_ascii=False), character_id),
+        )
+        conn.commit()
+
+    reload_characters()
+    return jsonify({"success": True, "id": character_id, "photo": photo_filename,
+                    "attributes": attributes})
+
+
+# ── Per-game character routes ─────────────────────────────────────────────────
+
+def _check_game_ownership(deploy_id: str, email: str):
+    """Return the deployment row if it belongs to email, else None."""
+    with get_db() as conn:
+        return conn.execute(
+            "SELECT id FROM deployments WHERE id=%s AND user_email=%s", (deploy_id, email)
+        ).fetchone()
+
+
+@app.get("/api/admin/game/<deploy_id>/characters")
+def admin_game_characters(deploy_id: str) -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Non connecté."}), 401
+    if not _check_game_ownership(deploy_id, email):
+        return jsonify({"error": "Introuvable ou accès refusé."}), 404
+    chars = load_game_characters(deploy_id)
+    result = []
+    for char in chars:
+        entry: dict[str, Any] = {
+            "id": char["id"], "name": char["name"],
+            "attributes": char.get("attributes", {}), "is_preset": char.get("is_preset", False),
+        }
+        if char.get("photo"):
+            entry["photo"] = char["photo"]
+        result.append(entry)
+    return jsonify(result)
+
+
+@app.post("/api/admin/game/<deploy_id>/characters")
+def admin_game_add_character(deploy_id: str) -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Non connecté."}), 401
+    if not _check_game_ownership(deploy_id, email):
+        return jsonify({"error": "Introuvable ou accès refusé."}), 404
+
+    name = str(request.form.get("name", "")).strip()
+    if not name:
+        return jsonify({"error": "Le nom est requis."}), 400
+
+    base_id = re.sub(r"[^a-z0-9]+", "-", normalize_text(name)).strip("-") or "personnage"
+    character_id = base_id
+    with get_db() as conn:
+        suffix = 1
+        while conn.execute(
+            "SELECT 1 FROM game_characters WHERE id=%s AND deployment_id=%s", (character_id, deploy_id)
+        ).fetchone():
+            character_id = f"{base_id}-{suffix}"
+            suffix += 1
+
+    photo_filename = None
+    photo_file = request.files.get("photo")
+    if photo_file and photo_file.filename:
+        ext = photo_file.filename.rsplit(".", 1)[-1].lower() if "." in photo_file.filename else ""
+        if ext not in ALLOWED_PHOTO_EXTENSIONS:
+            return jsonify({"error": f"Format non supporté. Acceptés : {', '.join(sorted(ALLOWED_PHOTO_EXTENSIONS))}"}), 400
+        file_bytes = photo_file.read()
+        if len(file_bytes) > MAX_PHOTO_BYTES:
+            return jsonify({"error": "Photo trop grande (max 8 Mo)."}), 400
+        safe_name = secure_filename(f"{deploy_id}-{character_id}.{ext}")
+        PHOTO_DIR.mkdir(exist_ok=True)
+        (PHOTO_DIR / safe_name).write_bytes(file_bytes)
+        photo_filename = safe_name
+
+    try:
+        attributes_raw = str(request.form.get("attributes", "{}")).strip() or "{}"
+        attributes = json.loads(attributes_raw)
+        if not isinstance(attributes, dict):
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        return jsonify({"error": "Format d'attributs invalide (JSON attendu)."}), 400
+
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO game_characters (id, deployment_id, name, photo_filename, attributes) VALUES (%s,%s,%s,%s,%s)",
+            (character_id, deploy_id, name, photo_filename, json.dumps(attributes, ensure_ascii=False)),
+        )
+        # Keep character_ids in deployments in sync
+        dep = conn.execute("SELECT character_ids FROM deployments WHERE id=%s", (deploy_id,)).fetchone()
+        if dep:
+            cur_ids = json.loads(dep["character_ids"])
+            if character_id not in cur_ids:
+                cur_ids.append(character_id)
+                conn.execute("UPDATE deployments SET character_ids=%s WHERE id=%s", (json.dumps(cur_ids), deploy_id))
+        conn.commit()
+
+    return jsonify({"success": True, "id": character_id, "name": name,
+                    "photo": photo_filename, "attributes": attributes, "is_preset": False}), 201
+
+
+@app.delete("/api/admin/game/<deploy_id>/characters/<character_id>")
+def admin_game_delete_character(deploy_id: str, character_id: str) -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Non connecté."}), 401
+    if not _check_game_ownership(deploy_id, email):
+        return jsonify({"error": "Introuvable ou accès refusé."}), 404
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT photo_filename FROM game_characters WHERE id=%s AND deployment_id=%s",
+            (character_id, deploy_id),
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Personnage introuvable."}), 404
+
+        conn.execute(
+            "DELETE FROM game_characters WHERE id=%s AND deployment_id=%s", (character_id, deploy_id)
+        )
+        # Keep character_ids in deployments in sync
+        dep = conn.execute("SELECT character_ids FROM deployments WHERE id=%s", (deploy_id,)).fetchone()
+        if dep:
+            cur_ids = [cid for cid in json.loads(dep["character_ids"]) if cid != character_id]
+            conn.execute("UPDATE deployments SET character_ids=%s WHERE id=%s", (json.dumps(cur_ids), deploy_id))
+        conn.commit()
+
+    return jsonify({"success": True})
+
+
+@app.post("/api/admin/game/<deploy_id>/characters/<character_id>/edit")
+def admin_game_edit_character(deploy_id: str, character_id: str) -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Non connecté."}), 401
+    if not _check_game_ownership(deploy_id, email):
+        return jsonify({"error": "Introuvable ou accès refusé."}), 404
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT photo_filename FROM game_characters WHERE id=%s AND deployment_id=%s",
+            (character_id, deploy_id),
+        ).fetchone()
+        if row is None:
+            return jsonify({"error": "Personnage introuvable."}), 404
+
+        photo_filename = row["photo_filename"]
+        photo_file = request.files.get("photo")
+        if photo_file and photo_file.filename:
+            ext = photo_file.filename.rsplit(".", 1)[-1].lower() if "." in photo_file.filename else ""
+            if ext not in ALLOWED_PHOTO_EXTENSIONS:
+                return jsonify({"error": f"Format non supporté. Acceptés : {', '.join(sorted(ALLOWED_PHOTO_EXTENSIONS))}"}), 400
+            file_bytes = photo_file.read()
+            if len(file_bytes) > MAX_PHOTO_BYTES:
+                return jsonify({"error": "Photo trop grande (max 8 Mo)."}), 400
+            if photo_filename and (PHOTO_DIR / photo_filename).exists():
+                (PHOTO_DIR / photo_filename).unlink(missing_ok=True)
+            safe_name = secure_filename(f"{deploy_id}-{character_id}.{ext}")
+            PHOTO_DIR.mkdir(exist_ok=True)
+            (PHOTO_DIR / safe_name).write_bytes(file_bytes)
+            photo_filename = safe_name
+
+        try:
+            attributes_raw = str(request.form.get("attributes", "{}")).strip() or "{}"
+            attributes = json.loads(attributes_raw)
+            if not isinstance(attributes, dict):
+                raise ValueError
+        except (json.JSONDecodeError, ValueError):
+            return jsonify({"error": "Format d'attributs invalide (JSON attendu)."}), 400
+
+        conn.execute(
+            "UPDATE game_characters SET photo_filename=%s, attributes=%s WHERE id=%s AND deployment_id=%s",
+            (photo_filename, json.dumps(attributes, ensure_ascii=False), character_id, deploy_id),
+        )
+        conn.commit()
+
+    return jsonify({"success": True, "id": character_id, "photo": photo_filename, "attributes": attributes})
+
+
+@app.post("/api/auth/login")
+def auth_login() -> Response:
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email", "")).strip().lower()
+    if not email or "@" not in email:
+        return jsonify({"error": "Adresse e-mail invalide."}), 400
+    session["user_email"] = email
+    return jsonify({"email": email})
+
+
+@app.post("/api/auth/logout")
+def auth_logout() -> Response:
+    session.pop("user_email", None)
+    return jsonify({"success": True})
+
+
+@app.get("/api/me")
+def api_me() -> Response:
+    return jsonify({"email": session.get("user_email")})
+
+
+# ── Deploy routes ─────────────────────────────────────────────────────────────
+
+@app.post("/api/deploy")
+def api_deploy() -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Connexion requise."}), 401
+    data = request.get_json(silent=True) or {}
+    char_ids = data.get("character_ids", [])
+    new_chars = data.get("new_chars", [])
+    if not isinstance(char_ids, list):
+        char_ids = []
+    if not isinstance(new_chars, list):
+        new_chars = []
+    reload_characters()
+    valid_ids = {c["id"] for c in CHARACTERS}
+    char_ids = [cid for cid in char_ids if isinstance(cid, str) and cid in valid_ids]
+    new_chars = [nc for nc in new_chars
+                 if isinstance(nc, dict) and isinstance(nc.get("name"), str) and nc["name"].strip()]
+    if not char_ids and not new_chars:
+        return jsonify({"error": "Ajoute au moins un personnage."}), 400
+    deploy_id = secrets.token_hex(4)
+    with get_db() as conn:
+        while conn.execute("SELECT 1 FROM deployments WHERE id=%s", (deploy_id,)).fetchone():
+            deploy_id = secrets.token_hex(4)
+        conn.execute(
+            "INSERT INTO deployments (id, user_email, character_ids) VALUES (%s,%s,%s)",
+            (deploy_id, email, json.dumps(char_ids)),
+        )
+        # Copy selected preset characters into game_characters
+        for cid in char_ids:
+            char = CHARACTER_BY_ID.get(cid)
+            if char:
+                conn.execute(
+                    "INSERT INTO game_characters (id, deployment_id, name, photo_filename, attributes) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (cid, deploy_id, char["name"], char.get("photo"),
+                     json.dumps(char.get("attributes", {}), ensure_ascii=False)),
+                )
+        # Insert pending custom chars created during new-game modal
+        for nc in new_chars:
+            nc_name = nc["name"].strip()[:80]
+            nc_id = secrets.token_hex(6)
+            nc_attrs = {k: str(v)[:120] for k, v in nc.get("attributes", {}).items()
+                        if isinstance(k, str) and isinstance(v, str)}
+            conn.execute(
+                "INSERT INTO game_characters (id, deployment_id, name, photo_filename, attributes) VALUES (%s,%s,%s,%s,%s)",
+                (nc_id, deploy_id, nc_name, None,
+                 json.dumps(nc_attrs, ensure_ascii=False)),
+            )
+        conn.commit()
+    return jsonify({"id": deploy_id, "url": f"/g/{deploy_id}"})
+
+
+@app.get("/g/<deployment_id>")
+def deployed_game(deployment_id: str) -> Response | str:
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM deployments WHERE id=%s", (deployment_id,)).fetchone()
+    if row is None:
+        return "Lien de jeu introuvable.", 404
+    return render_template(
+        "index.html",
+        user_email=session.get("user_email", ""),
+        show_login_modal=False,
+        next_url="",
+        deployment_id=deployment_id,
+        show_admin=False,
+    )
+
+
+@app.get("/api/deployments")
+def api_list_deployments() -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Connexion requise."}), 401
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, created_at FROM deployments WHERE user_email=%s ORDER BY created_at DESC",
+            (email,),
+        ).fetchall()
+        result = []
+        for row in rows:
+            char_rows = conn.execute(
+                "SELECT id, name FROM game_characters WHERE deployment_id=%s ORDER BY name",
+                (row["id"],),
+            ).fetchall()
+            result.append({
+                "id": row["id"],
+                "url": f"/g/{row['id']}",
+                "character_ids": [r["id"] for r in char_rows],
+                "character_names": [r["name"] for r in char_rows],
+                "created_at": row["created_at"],
+            })
+    return jsonify(result)
+
+
+@app.patch("/api/deployments/<deploy_id>")
+def api_update_deployment(deploy_id: str) -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Connexion requise."}), 401
+    data = request.get_json(silent=True) or {}
+    char_ids = data.get("character_ids")
+    if not isinstance(char_ids, list) or not char_ids:
+        return jsonify({"error": "Sélectionnez au moins un personnage."}), 400
+    reload_characters()
+    valid_ids = {c["id"] for c in CHARACTERS}
+    char_ids = [cid for cid in char_ids if cid in valid_ids]
+    if not char_ids:
+        return jsonify({"error": "Aucun personnage valide."}), 400
+    with get_db() as conn:
+        row = conn.execute("SELECT user_email FROM deployments WHERE id=%s", (deploy_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Introuvable."}), 404
+        if row["user_email"] != email:
+            return jsonify({"error": "Accès refusé."}), 403
+        conn.execute(
+            "UPDATE deployments SET character_ids=%s WHERE id=%s",
+            (json.dumps(char_ids), deploy_id),
+        )
+        # Sync game_characters: remove excluded, add new from global pool
+        current_ids = {r["id"] for r in conn.execute(
+            "SELECT id FROM game_characters WHERE deployment_id=%s", (deploy_id,)
+        ).fetchall()}
+        new_ids = set(char_ids)
+        for removed_id in current_ids - new_ids:
+            conn.execute(
+                "DELETE FROM game_characters WHERE id=%s AND deployment_id=%s",
+                (removed_id, deploy_id),
+            )
+        for added_id in new_ids - current_ids:
+            char = CHARACTER_BY_ID.get(added_id)
+            if char:
+                conn.execute(
+                    "INSERT INTO game_characters (id, deployment_id, name, photo_filename, attributes) VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                    (added_id, deploy_id, char["name"], char.get("photo"),
+                     json.dumps(char.get("attributes", {}), ensure_ascii=False)),
+                )
+        conn.commit()
+    return jsonify({"success": True})
+
+
+@app.delete("/api/deployments/<deploy_id>")
+def api_delete_deployment(deploy_id: str) -> Response:
+    email = session.get("user_email")
+    if not email:
+        return jsonify({"error": "Connexion requise."}), 401
+    with get_db() as conn:
+        row = conn.execute("SELECT user_email FROM deployments WHERE id=%s", (deploy_id,)).fetchone()
+        if row is None:
+            return jsonify({"error": "Introuvable."}), 404
+        if row["user_email"] != email:
+            return jsonify({"error": "Accès refusé."}), 403
+        conn.execute("DELETE FROM deployments WHERE id=%s", (deploy_id,))
+        conn.commit()
+    return jsonify({"success": True})
 
 
 if __name__ == "__main__":
